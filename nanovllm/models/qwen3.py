@@ -5,7 +5,7 @@ from transformers import Qwen3Config
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import Linear, MergedLinear
+from nanovllm.layers.linear import Linear, MergedLinear, QKVParallelLinear
 from nanovllm.layers.rotary_embedding import RotaryEmbedding
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
@@ -29,10 +29,12 @@ class Qwen3Attention(nn.Module):
         self.head_dim = head_dim or hidden_size // num_heads
         self.scaling = self.head_dim ** -0.5
 
-        # QKV投影 (合并为一个Linear)
-        self.qkv_proj = MergedLinear(
+        # QKV投影 (先合并为一个Linear)
+        self.qkv_proj = QKVParallelLinear(
             hidden_size,
-            [num_heads * self.head_dim, num_kv_heads * self.head_dim, num_kv_heads * self.head_dim],
+            self.head_dim,
+            num_heads,
+            num_kv_heads,
             bias=qkv_bias,
         )
 
@@ -56,6 +58,7 @@ class Qwen3Attention(nn.Module):
             num_heads=num_heads,
             head_dim=self.head_dim,
             scale=self.scaling,
+            num_kv_heads=num_kv_heads,
         )
 
         # Q/K归一化 (Qwen3特有)
@@ -67,6 +70,9 @@ class Qwen3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache_len: int = 0,
+        is_prefill: bool = True,
     ) -> torch.Tensor:
         # QKV投影
         qkv = self.qkv_proj(hidden_states)
@@ -89,7 +95,17 @@ class Qwen3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         # 注意力计算
-        o = self.attn(q, k, v)
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+        else:
+            k_cache = v_cache = None
+        o = self.attn(
+            q, k, v,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_len=cache_len,
+            is_prefill=is_prefill,
+        )
 
         # 输出投影
         output = self.o_proj(o)
@@ -107,7 +123,7 @@ class Qwen3MLP(nn.Module):
         # gate和up合并
         self.gate_up_proj = MergedLinear(
             hidden_size,
-            [intermediate_size, intermediate_size],
+            [intermediate_size] * 2,
             bias=False,
         )
         self.down_proj = Linear(
@@ -153,6 +169,9 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache_len: int = 0,
+        is_prefill: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Pre-attention norm
         if residual is None:
@@ -161,7 +180,13 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # Self-attention
-        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = self.self_attn(
+            positions,
+            hidden_states,
+            kv_cache=kv_cache,
+            cache_len=cache_len,
+            is_prefill=is_prefill,
+        )
 
         # Post-attention norm + MLP
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -184,23 +209,33 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        cache_len: int = 0,
+        is_prefill: bool = True,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
 
-        for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        for layer_idx, layer in enumerate(self.layers):
+            kv_cache = kv_caches[layer_idx] if kv_caches is not None else None
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                residual,
+                kv_cache=kv_cache,
+                cache_len=cache_len,
+                is_prefill=is_prefill,
+            )
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
 class Qwen3ForCausalLM(nn.Module):
-    # safetensors中的权重名称 -> 模型中的参数名称映射
     packed_modules_mapping = {
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
@@ -220,8 +255,17 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        cache_len: int = 0,
+        is_prefill: bool = True,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return self.model(
+            input_ids,
+            positions,
+            kv_caches=kv_caches,
+            cache_len=cache_len,
+            is_prefill=is_prefill,
+        )
 
     def compute_logits(
         self,

@@ -19,6 +19,7 @@ class RMSNorm(nn.Module):
         if residual is not None:
             orig_dtype = x.dtype
             x = x.float() + residual.float()
+            residual = x.to(orig_dtype)  # 关键：更新 residual
             var = x.pow(2).mean(-1, keepdim=True)
             x = x * torch.rsqrt(var + self.eps)
             x = x.to(orig_dtype)

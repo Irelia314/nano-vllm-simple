@@ -26,6 +26,22 @@ class SimpleLLM:
         self.model.cuda()
         self.model.eval()
 
+    def _init_kv_cache(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        hf_config = self.config.hf_config
+        num_layers = hf_config.num_hidden_layers
+        num_kv_heads = hf_config.num_key_value_heads
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        max_len = self.config.max_model_len
+        param = next(self.model.parameters())
+        device = param.device
+        dtype = param.dtype
+        kv_caches = []
+        for _ in range(num_layers):
+            k_cache = torch.empty(max_len, num_kv_heads, head_dim, device=device, dtype=dtype)
+            v_cache = torch.empty(max_len, num_kv_heads, head_dim, device=device, dtype=dtype)
+            kv_caches.append((k_cache, v_cache))
+        return kv_caches
+
     def generate(
         self, 
         prompt: str, 
@@ -38,22 +54,48 @@ class SimpleLLM:
         # 编码prompt
         tokens = self.tokenizer.encode(prompt)
 
+        # 初始化KV Cache
+        kv_caches = self._init_kv_cache()
+
         # 自回归生成
         with torch.inference_mode():
-            for _ in range(params.max_tokens):
-                # 准备输入
-                input_ids = torch.tensor([tokens], dtype=torch.long).cuda()
-                positions = torch.arange(len(tokens), dtype=torch.long).cuda()
+            if params.max_tokens <= 0:
+                return self.tokenizer.decode(tokens)
 
-                # 前向传播
-                hidden_states = self.model(input_ids, positions)
+            device = next(self.model.parameters()).device
+            # prefill
+            input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            positions = torch.arange(len(tokens), dtype=torch.long, device=device)
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                kv_caches=kv_caches,
+                cache_len=0,
+                is_prefill=True,
+            )
+            logits = self.model.compute_logits(hidden_states)
+            next_token = self._sample(logits[0, -1], params.temperature)
+            tokens.append(next_token)
+
+            if not params.ignore_eos and next_token == self.eos_token_id:
+                return self.tokenizer.decode(tokens)
+
+            cache_len = len(tokens) - 1
+            for _ in range(params.max_tokens - 1):
+                input_ids = torch.tensor([[tokens[-1]]], dtype=torch.long, device=device)
+                positions = torch.tensor([cache_len], dtype=torch.long, device=device)
+                hidden_states = self.model(
+                    input_ids,
+                    positions,
+                    kv_caches=kv_caches,
+                    cache_len=cache_len,
+                    is_prefill=False,
+                )
                 logits = self.model.compute_logits(hidden_states)
-
-                # 采样下一个token
                 next_token = self._sample(logits[0, -1], params.temperature)
                 tokens.append(next_token)
+                cache_len += 1
 
-                # 检查是否结束
                 if not params.ignore_eos and next_token == self.eos_token_id:
                     break
 
@@ -73,10 +115,10 @@ class SimpleLLM:
 
 # 使用示例
 if __name__ == "__main__":
-    model_path = os.path.expanduser("~/qwen3-4b-thinking/")
+    model_path = os.path.expanduser("/data/huangfangjie/qwen3-4b-thinking/")
     llm = SimpleLLM(model_path)
 
     params = SamplingParams(temperature=0.8, max_tokens=100)
     output = llm.generate("Hello, how are you?", params)
-
+    # llm.verify_kv_cache("Hello, how are you?", steps=2)
     print(f"Output: {output}")

@@ -13,28 +13,18 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 def load_model(model: nn.Module, path: str):
     """从safetensors文件加载模型权重"""
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
-
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, framework="pt", device="cpu") as f:
             for weight_name in f.keys():
-                # 检查是否需要权重名称映射
-                param_name = weight_name
-                shard_id = None
                 for k in packed_modules_mapping:
                     if k in weight_name:
-                        v, sid = packed_modules_mapping[k]
+                        v, shard_id = packed_modules_mapping[k]
                         param_name = weight_name.replace(k, v)
-                        shard_id = sid
+                        param = model.get_parameter(param_name)
+                        weight_loader = getattr(param, "weight_loader")
+                        weight_loader(param, f.get_tensor(weight_name), shard_id)
                         break
-
-                try:
-                    param = model.get_parameter(param_name)
+                else:
+                    param = model.get_parameter(weight_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    loaded_weight = f.get_tensor(weight_name)
-                    if shard_id is not None:
-                        weight_loader(param, loaded_weight, shard_id)
-                    else:
-                        weight_loader(param, loaded_weight)
-                except AttributeError:
-                    # 如果找不到参数，跳过
-                    continue
+                    weight_loader(param, f.get_tensor(weight_name))
